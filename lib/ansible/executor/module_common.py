@@ -93,6 +93,7 @@ ZIPLOADER_WRAPPER = True # For test-module script to tell this is a ZIPLOADER_WR
 # USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import os
 import sys
+import shlex
 import base64
 import shutil
 import zipfile
@@ -121,7 +122,10 @@ def invoke_module(module, modlib_path, json_params):
     else:
         os.environ['PYTHONPATH'] = modlib_path
 
-    p = subprocess.Popen([%(interpreter)s, module], env=os.environ, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+    popen_args = shlex.split(%(interpreter)s)
+    popen_args.append(module)
+
+    p = subprocess.Popen(popen_args, env=os.environ, shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
     (stdout, stderr) = p.communicate(json_params)
 
     if not isinstance(stderr, (bytes, unicode)):
