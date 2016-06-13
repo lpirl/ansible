@@ -5,7 +5,9 @@ Vault
 
 New in Ansible 1.5, "Vault" is a feature of ansible that allows keeping sensitive data such as passwords or keys in encrypted files, rather than as plaintext in your playbooks or roles. These vault files can then be distributed or placed in source control.
 
-To enable this feature, a command line tool, `ansible-vault` is used to edit files, and a command line flag `--ask-vault-pass` or `--vault-password-file` is used. Alternately, you may specify the location of a password file in your  ansible.cfg file. This option requires no command line flag usage.
+To enable this feature, a command line tool, `ansible-vault` is used to edit files, and a command line flag `--ask-vault-pass` or `--vault-password-file` is used. Alternately, you may specify the location of a password file or command Ansible to always prompt for the password in your ansible.cfg file. These options require no command line flag usage.
+
+For best practices advice, refer to :ref:`best_practices_for_variables_and_vaults`.
 
 .. _what_can_be_encrypted_with_vault:
 
@@ -27,7 +29,7 @@ To create a new encrypted data file, run the following command::
 
 First you will be prompted for a password.  The password used with vault currently must be the same for all files you wish to use together at the same time.
 
-After providing a password, the tool will launch whatever editor you have defined with $EDITOR, and defaults to vim.  Once you are done with the editor session, the file will be saved as encrypted data.
+After providing a password, the tool will launch whatever editor you have defined with $EDITOR, and defaults to vi (before 2.1 the default was vim).  Once you are done with the editor session, the file will be saved as encrypted data.
 
 The default cipher is AES (which is shared-secret based).
 
@@ -102,11 +104,20 @@ Alternatively, passwords can be specified with a file or a script, the script ve
 
 The password should be a string stored as a single line in the file.
 
+.. note::
+   You can also set ``ANSIBLE_VAULT_PASSWORD_FILE`` environment variable, e.g. ``ANSIBLE_VAULT_PASSWORD_FILE=~/.vault_pass.txt`` and Ansible will automatically search for the password in that file.
+
 If you are using a script instead of a flat file, ensure that it is marked as executable, and that the password is printed to standard output.  If your script needs to prompt for data, prompts can be sent to standard error.
 
 This is something you may wish to do if using Ansible from a continuous integration system like Jenkins.
 
 (The `--vault-password-file` option can also be used with the :ref:`ansible-pull` command if you wish, though this would require distributing the keys to your nodes, so understand the implications -- vault is more intended for push mode).
 
+.. _speeding_up_vault:
 
+Speeding Up Vault Operations
+````````````````````````````
 
+By default, Ansible uses PyCrypto to encrypt and decrypt vault files. If you have many encrypted files, decrypting them at startup may cause a perceptible delay. To speed this up, install the cryptography package::
+
+    pip install cryptography

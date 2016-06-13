@@ -137,7 +137,7 @@
 
 - name: decide to include or not include selinux tests
   include: selinux_tests.yml
-  when: selinux_installed.stdout != "" and selinux_enabled.stdout != "Disabled"
+  when: selinux_installed is defined and selinux_installed.stdout != "" and selinux_enabled.stdout != "Disabled"
 
 - name: remote directory foobar
   file: path={{output_dir}}/foobar state=absent
@@ -248,7 +248,7 @@
     that:
       - 'item.changed == true'
       - 'item.state == "file"'
-  with_items: file16_result.results
+  with_items: "{{file16_result.results}}"
 
 - name: try to force the sub-directory to a link
   file: src={{output_dir}}/testing dest={{output_dir}}/sub1 state=link force=yes

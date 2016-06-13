@@ -19,35 +19,44 @@ __metaclass__ = type
 
 import os
 
+from ansible import constants as C
 from ansible.errors import AnsibleError
 from ansible.plugins.lookup import LookupBase
-from ansible.template import Templar
+from ansible.utils.unicode import to_unicode
+
+try:
+    from __main__ import display
+except ImportError:
+    from ansible.utils.display import Display
+    display = Display()
+
 
 class LookupModule(LookupBase):
 
     def run(self, terms, variables, **kwargs):
 
-        if not isinstance(terms, list):
-            terms = [ terms ]
+        convert_data_p = kwargs.get('convert_data', True)
+        basedir = self.get_basedir(variables)
 
         ret = []
 
-        templar = Templar(loader=self._loader, variables=variables)
-
-        if 'role_path' in variables:
-            basedir = variables['role_path']
-        else:
-            basedir = self._loader.get_basedir()
-
         for term in terms:
-            self._display.debug("File lookup term: %s" % term)
+            display.debug("File lookup term: %s" % term)
 
             lookupfile = self._loader.path_dwim_relative(basedir, 'templates', term)
-            self._display.vvvv("File lookup using %s as file" % lookupfile)
+            display.vvvv("File lookup using %s as file" % lookupfile)
             if lookupfile and os.path.exists(lookupfile):
                 with open(lookupfile, 'r') as f:
-                    template_data = f.read()
-                    res = templar.template(template_data, preserve_trailing_newlines=True)
+                    template_data = to_unicode(f.read())
+
+                    searchpath = [self._loader._basedir, os.path.dirname(lookupfile)]
+                    if 'role_path' in variables:
+                        if C.DEFAULT_ROLES_PATH:
+                            searchpath[:0] = C.DEFAULT_ROLES_PATH
+                        searchpath.insert(1, variables['role_path'])
+
+                    self._templar.environment.loader.searchpath = searchpath
+                    res = self._templar.template(template_data, preserve_trailing_newlines=True,convert_data=convert_data_p)
                     ret.append(res)
             else:
                 raise AnsibleError("the template file %s could not be found for the lookup" % term)

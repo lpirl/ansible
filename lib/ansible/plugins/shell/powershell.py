@@ -20,11 +20,11 @@ __metaclass__ = type
 import base64
 import os
 import re
-import random
 import shlex
-import time
 
-_common_args = ['PowerShell', '-NoProfile', '-NonInteractive']
+from ansible.utils.unicode import to_bytes, to_unicode
+
+_common_args = ['PowerShell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Unrestricted']
 
 # Primarily for testing, allow explicitly specifying PowerShell version via
 # an environment variable.
@@ -34,28 +34,56 @@ if _powershell_version:
 
 class ShellModule(object):
 
+    # Common shell filenames that this plugin handles
+    # Powershell is handled differently.  It's selected when winrm is the
+    # connection
+    COMPATIBLE_SHELLS = frozenset()
+    # Family of shells this has.  Must match the filename without extension
+    SHELL_FAMILY = 'powershell'
+
     def env_prefix(self, **kwargs):
         return ''
 
     def join_path(self, *args):
-        return os.path.join(*args).replace('/', '\\')
+        parts = []
+        for arg in args:
+            arg = self._unquote(arg).replace('/', '\\')
+            parts.extend([a for a in arg.split('\\') if a])
+        path = '\\'.join(parts)
+        if path.startswith('~'):
+            return path
+        return '\'%s\'' % path
+
+    # powershell requires that script files end with .ps1
+    def get_remote_filename(self, base_name):
+        if not base_name.strip().lower().endswith('.ps1'):
+            return base_name.strip() + '.ps1'
+
+        return base_name.strip()
 
     def path_has_trailing_slash(self, path):
         # Allow Windows paths to be specified using either slash.
+        path = self._unquote(path)
         return path.endswith('/') or path.endswith('\\')
 
-    def chmod(self, mode, path):
-        return ''
+    def chmod(self, mode, path, recursive=True):
+        raise NotImplementedError('chmod is not implemented for Powershell')
+
+    def chown(self, path, user, group=None, recursive=True):
+        raise NotImplementedError('chown is not implemented for Powershell')
+
+    def set_user_facl(self, path, user, mode, recursive=True):
+        raise NotImplementedError('set_user_facl is not implemented for Powershell')
 
     def remove(self, path, recurse=False):
-        path = self._escape(path)
+        path = self._escape(self._unquote(path))
         if recurse:
             return self._encode_script('''Remove-Item "%s" -Force -Recurse;''' % path)
         else:
             return self._encode_script('''Remove-Item "%s" -Force;''' % path)
 
     def mkdtemp(self, basefile, system=False, mode=None):
-        basefile = self._escape(basefile)
+        basefile = self._escape(self._unquote(basefile))
         # FIXME: Support system temp path!
         return self._encode_script('''(New-Item -Type Directory -Path $env:temp -Name "%s").FullName | Write-Host -Separator '';''' % basefile)
 
@@ -63,16 +91,33 @@ class ShellModule(object):
         # PowerShell only supports "~" (not "~username").  Resolve-Path ~ does
         # not seem to work remotely, though by default we are always starting
         # in the user's home directory.
+        user_home_path = self._unquote(user_home_path)
         if user_home_path == '~':
             script = 'Write-Host (Get-Location).Path'
         elif user_home_path.startswith('~\\'):
-            script = 'Write-Host ((Get-Location).Path + "%s")' % _escape(user_home_path[1:])
+            script = 'Write-Host ((Get-Location).Path + "%s")' % self._escape(user_home_path[1:])
         else:
-            script = 'Write-Host "%s"' % _escape(user_home_path)
+            script = 'Write-Host "%s"' % self._escape(user_home_path)
+        return self._encode_script(script)
+
+    def exists(self, path):
+        path = self._escape(self._unquote(path))
+        script = '''
+            If (Test-Path "%s")
+            {
+                $res = 0;
+            }
+            Else
+            {
+                $res = 1;
+            }
+            Write-Host "$res";
+            Exit $res;
+         ''' % path
         return self._encode_script(script)
 
     def checksum(self, path, *args, **kwargs):
-        path = self._escape(path)
+        path = self._escape(self._unquote(path))
         script = '''
             If (Test-Path -PathType Leaf "%(path)s")
             {
@@ -92,16 +137,66 @@ class ShellModule(object):
         ''' % dict(path=path)
         return self._encode_script(script)
 
-    def build_module_command(self, env_string, shebang, cmd, rm_tmp=None):
-        cmd = cmd.encode('utf-8')
-        cmd_parts = shlex.split(cmd, posix=False)
-        if not cmd_parts[0].lower().endswith('.ps1'):
-            cmd_parts[0] = '%s.ps1' % cmd_parts[0]
-        script = self._build_file_cmd(cmd_parts)
+    def build_module_command(self, env_string, shebang, cmd, arg_path=None, rm_tmp=None):
+        cmd_parts = shlex.split(to_bytes(cmd), posix=False)
+        cmd_parts = map(to_unicode, cmd_parts)
+        if shebang and shebang.lower() == '#!powershell':
+            if not self._unquote(cmd_parts[0]).lower().endswith('.ps1'):
+                cmd_parts[0] = '"%s.ps1"' % self._unquote(cmd_parts[0])
+            cmd_parts.insert(0, '&')
+        elif shebang and shebang.startswith('#!'):
+            cmd_parts.insert(0, shebang[2:])
+        script = '''
+            Try
+            {
+                %s
+            }
+            Catch
+            {
+                $_obj = @{ failed = $true }
+                If ($_.Exception.GetType)
+                {
+                    $_obj.Add('msg', $_.Exception.Message)
+                }
+                Else
+                {
+                    $_obj.Add('msg', $_.ToString())
+                }
+                If ($_.InvocationInfo.PositionMessage)
+                {
+                    $_obj.Add('exception', $_.InvocationInfo.PositionMessage)
+                }
+                ElseIf ($_.ScriptStackTrace)
+                {
+                    $_obj.Add('exception', $_.ScriptStackTrace)
+                }
+                Try
+                {
+                    $_obj.Add('error_record', ($_ | ConvertTo-Json | ConvertFrom-Json))
+                }
+                Catch
+                {
+                }
+                Echo $_obj | ConvertTo-Json -Compress -Depth 99
+                Exit 1
+            }
+        ''' % (' '.join(cmd_parts))
         if rm_tmp:
-            rm_tmp = self._escape(rm_tmp)
-            script = '%s; Remove-Item "%s" -Force -Recurse;' % (script, rm_tmp)
+            rm_tmp = self._escape(self._unquote(rm_tmp))
+            rm_cmd = 'Remove-Item "%s" -Force -Recurse -ErrorAction SilentlyContinue' % rm_tmp
+            script = '%s\nFinally { %s }' % (script, rm_cmd)
         return self._encode_script(script)
+
+    def _unquote(self, value):
+        '''Remove any matching quotes that wrap the given value.'''
+        value = to_unicode(value or '')
+        m = re.match(r'^\s*?\'(.*?)\'\s*?$', value)
+        if m:
+            return m.group(1)
+        m = re.match(r'^\s*?"(.*?)"\s*?$', value)
+        if m:
+            return m.group(1)
+        return value
 
     def _escape(self, value, include_vars=False):
         '''Return value escaped for use in PowerShell command.'''
@@ -117,16 +212,14 @@ class ShellModule(object):
         replace = lambda m: substs[m.lastindex - 1]
         return re.sub(pattern, replace, value)
 
-    def _encode_script(self, script, as_list=False):
+    def _encode_script(self, script, as_list=False, strict_mode=True):
         '''Convert a PowerShell script to a single base64-encoded command.'''
+        script = to_unicode(script)
+        if strict_mode:
+            script = u'Set-StrictMode -Version Latest\r\n%s' % script
         script = '\n'.join([x.strip() for x in script.splitlines() if x.strip()])
         encoded_script = base64.b64encode(script.encode('utf-16-le'))
         cmd_parts = _common_args + ['-EncodedCommand', encoded_script]
         if as_list:
             return cmd_parts
         return ' '.join(cmd_parts)
-
-    def _build_file_cmd(self, cmd_parts):
-        '''Build command line to run a file, given list of file name plus args.'''
-        return ' '.join(_common_args + ['-ExecutionPolicy', 'Unrestricted', '-File'] + ['"%s"' % x for x in cmd_parts])
-

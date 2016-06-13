@@ -19,7 +19,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-from ansible.parsing import DataLoader
+from ansible.parsing.dataloader import DataLoader
 
 class TaskResult:
     '''
@@ -40,14 +40,16 @@ class TaskResult:
         return self._check_key('changed')
 
     def is_skipped(self):
+        # loop results
         if 'results' in self._result and self._task.loop:
-            flag = True
-            for res in self._result.get('results', []):
-                if isinstance(res, dict):
-                    flag &= res.get('skipped', False)
-            return flag
-        else:
-            return self._result.get('skipped', False)
+            results = self._result['results']
+            # Loop tasks are only considered skipped if all items were skipped.
+            # some squashed results (eg, yum) are not dicts and can't be skipped individually
+            if results and all(isinstance(res, dict) and res.get('skipped', False) for res in results):
+                return True
+
+        # regular tasks and squashed non-dict results
+        return self._result.get('skipped', False)
 
     def is_failed(self):
         if 'failed_when_result' in self._result or \

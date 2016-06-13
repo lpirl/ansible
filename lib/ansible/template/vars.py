@@ -19,7 +19,9 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+from ansible.compat.six import iteritems
 from jinja2.utils import missing
+from ansible.utils.unicode import to_unicode
 
 __all__ = ['AnsibleJ2Vars']
 
@@ -46,7 +48,7 @@ class AnsibleJ2Vars:
         self._extras  = extras
         self._locals  = dict()
         if isinstance(locals, dict):
-            for key, val in locals.iteritems():
+            for key, val in iteritems(locals):
                 if key[:2] == 'l_' and val is not missing:
                     self._locals[key[2:]] = val
 
@@ -63,9 +65,6 @@ class AnsibleJ2Vars:
         return False
 
     def __getitem__(self, varname):
-        # FIXME: are we still going to need HostVars?
-        #from ansible.runner import HostVars
-
         if varname not in self._templar._available_variables:
             if varname in self._locals:
                 return self._locals[varname]
@@ -85,7 +84,12 @@ class AnsibleJ2Vars:
         if isinstance(variable, dict) and varname == "vars" or isinstance(variable, HostVars):
             return variable
         else:
-            return self._templar.template(variable)
+            value = None
+            try:
+                value = self._templar.template(variable)
+            except Exception as e:
+                raise type(e)(to_unicode(variable) + ': ' + e.message)
+            return value
 
     def add_locals(self, locals):
         '''

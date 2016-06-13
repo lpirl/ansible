@@ -28,8 +28,11 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
+import os
+import re
 from uuid import UUID
 
+from ansible.module_utils.basic import BOOLEANS
 
 FINAL_STATUSES = ('ACTIVE', 'ERROR')
 VOLUME_STATUS = ('available', 'attaching', 'creating', 'deleting', 'in-use',
@@ -260,7 +263,7 @@ def rax_required_together():
 
 def setup_rax_module(module, rax_module, region_required=True):
     """Set up pyrax in a standard way for all modules"""
-    rax_module.USER_AGENT = 'ansible/%s %s' % (ANSIBLE_VERSION,
+    rax_module.USER_AGENT = 'ansible/%s %s' % (module.ansible_version,
                                                rax_module.USER_AGENT)
 
     api_key = module.params.get('api_key')

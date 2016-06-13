@@ -15,12 +15,17 @@
 # You should have received a copy of the GNU General Public License
 # along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import absolute_import
+# Make coding more python3-ish
+from __future__ import (absolute_import, division, print_function)
+__metaclass__ = type
+
 
 import sys
 import base64
+import itertools
 import json
 import os.path
+import ntpath
 import types
 import pipes
 import glob
@@ -36,11 +41,14 @@ import uuid
 import yaml
 from jinja2.filters import environmentfilter
 from distutils.version import LooseVersion, StrictVersion
+from ansible.compat.six import iteritems, string_types
 
 from ansible import errors
 from ansible.parsing.yaml.dumper import AnsibleDumper
 from ansible.utils.hashing import md5s, checksum_s
 from ansible.utils.unicode import unicode_wrap, to_unicode
+from ansible.utils.vars import merge_hash
+from ansible.vars.hostvars import HostVars
 
 try:
     import passlib.hash
@@ -50,6 +58,17 @@ except:
 
 
 UUID_NAMESPACE_ANSIBLE = uuid.UUID('361E6D51-FAEC-444A-9079-341386DA8E2E')
+
+class AnsibleJSONEncoder(json.JSONEncoder):
+    '''
+    Simple encoder class to deal with JSON encoding of internal
+    types like HostVars
+    '''
+    def default(self, o):
+        if isinstance(o, HostVars):
+            return dict(o)
+        else:
+            return o
 
 def to_yaml(a, *args, **kw):
     '''Make verbose, human readable yaml'''
@@ -63,7 +82,7 @@ def to_nice_yaml(a, *args, **kw):
 
 def to_json(a, *args, **kw):
     ''' Convert the value to JSON '''
-    return json.dumps(a, *args, **kw)
+    return json.dumps(a, cls=AnsibleJSONEncoder, *args, **kw)
 
 def to_nice_json(a, *args, **kw):
     '''Make verbose, human readable JSON'''
@@ -81,64 +100,17 @@ def to_nice_json(a, *args, **kw):
             else:
                 if major >= 2:
                     return simplejson.dumps(a, indent=4, sort_keys=True, *args, **kw)
+    try:
+        return json.dumps(a, indent=4, sort_keys=True, cls=AnsibleJSONEncoder, *args, **kw)
+    except:
         # Fallback to the to_json filter
         return to_json(a, *args, **kw)
-    return json.dumps(a, indent=4, sort_keys=True, *args, **kw)
 
-def failed(*a, **kw):
-    ''' Test if task result yields failed '''
-    item = a[0]
-    if type(item) != dict:
-        raise errors.AnsibleFilterError("|failed expects a dictionary")
-    rc = item.get('rc',0)
-    failed = item.get('failed',False)
-    if rc != 0 or failed:
-        return True
-    else:
-        return False
-
-def success(*a, **kw):
-    ''' Test if task result yields success '''
-    return not failed(*a, **kw)
-
-def changed(*a, **kw):
-    ''' Test if task result yields changed '''
-    item = a[0]
-    if type(item) != dict:
-        raise errors.AnsibleFilterError("|changed expects a dictionary")
-    if not 'changed' in item:
-        changed = False
-        if ('results' in item    # some modules return a 'results' key
-                and type(item['results']) == list
-                and type(item['results'][0]) == dict):
-            for result in item['results']:
-                changed = changed or result.get('changed', False)
-    else:
-        changed = item.get('changed', False)
-    return changed
-
-def skipped(*a, **kw):
-    ''' Test if task result yields skipped '''
-    item = a[0]
-    if type(item) != dict:
-        raise errors.AnsibleFilterError("|skipped expects a dictionary")
-    skipped = item.get('skipped', False)
-    return skipped
-
-def mandatory(a):
-    ''' Make a variable mandatory '''
-    try:
-        a
-    except NameError:
-        raise errors.AnsibleFilterError('Mandatory variable not defined.')
-    else:
-        return a
-
-def bool(a):
+def to_bool(a):
     ''' return a bool for the arg '''
     if a is None or type(a) == bool:
         return a
-    if type(a) in types.StringTypes:
+    if isinstance(a, string_types):
         a = a.lower()
     if a in ['yes', 'on', '1', 'true', 1]:
         return True
@@ -153,27 +125,6 @@ def fileglob(pathname):
     ''' return list of matched files for glob '''
     return glob.glob(pathname)
 
-def regex(value='', pattern='', ignorecase=False, match_type='search'):
-    ''' Expose `re` as a boolean filter using the `search` method by default.
-        This is likely only useful for `search` and `match` which already
-        have their own filters.
-    '''
-    if ignorecase:
-        flags = re.I
-    else:
-        flags = 0
-    _re = re.compile(pattern, flags=flags)
-    _bool = __builtins__.get('bool')
-    return _bool(getattr(_re, match_type, 'search')(value))
-
-def match(value, pattern='', ignorecase=False):
-    ''' Perform a `re.match` returning a boolean '''
-    return regex(value, pattern, ignorecase, 'match')
-
-def search(value, pattern='', ignorecase=False):
-    ''' Perform a `re.search` returning a boolean '''
-    return regex(value, pattern, ignorecase, 'search')
-
 def regex_replace(value='', pattern='', replacement='', ignorecase=False):
     ''' Perform a `re.sub` returning a string '''
 
@@ -186,6 +137,45 @@ def regex_replace(value='', pattern='', replacement='', ignorecase=False):
         flags = 0
     _re = re.compile(pattern, flags=flags)
     return _re.sub(replacement, value)
+
+def regex_findall(value, regex, multiline=False, ignorecase=False):
+    ''' Perform re.findall and return the list of matches '''
+    flags = 0
+    if ignorecase:
+        flags |= re.I
+    if multiline:
+        flags |= re.M
+    return re.findall(regex, value, flags)
+
+def regex_search(value, regex, *args, **kwargs):
+    ''' Perform re.search and return the list of matches or a backref '''
+
+    groups = list()
+    for arg in args:
+        if arg.startswith('\\g'):
+            match = re.match(r'\\g<(\S+)>', arg).group(1)
+            groups.append(match)
+        elif arg.startswith('\\'):
+            match = int(re.match(r'\\(\d+)', arg).group(1))
+            groups.append(match)
+        else:
+            raise errors.AnsibleFilterError('Unknown argument')
+
+    flags = 0
+    if kwargs.get('ignorecase'):
+        flags |= re.I
+    if kwargs.get('multiline'):
+        flags |= re.M
+
+    match = re.search(regex, value, flags)
+    if match:
+        if not groups:
+            return match.group()
+        else:
+            items = list()
+            for item in groups:
+                items.append(match.group(item))
+            return items
 
 def ternary(value, true_val, false_val):
     '''  value ? true_val : false_val '''
@@ -219,8 +209,12 @@ def version_compare(value, version, operator='eq', strict=False):
     try:
         method = getattr(py_operator, operator)
         return method(Version(str(value)), Version(str(version)))
-    except Exception, e:
+    except Exception as e:
         raise errors.AnsibleFilterError('Version comparison: %s' % e)
+
+def regex_escape(string):
+    '''Escape all regular expressions special characters from STRING.'''
+    return re.escape(string)
 
 @environmentfilter
 def rand(environment, end, start=None, step=None):
@@ -270,7 +264,11 @@ def get_encrypted_password(password, hashtype='sha512', salt=None):
     if hashtype in cryptmethod:
         if salt is None:
             r = SystemRandom()
-            salt = ''.join([r.choice(string.ascii_letters + string.digits) for _ in range(16)])
+            if hashtype in ['md5']:
+                saltsize = 8
+            else:
+                saltsize = 16
+            salt = ''.join([r.choice(string.ascii_letters + string.digits) for _ in range(saltsize)])
 
         if not HAS_PASSLIB:
             if sys.platform.startswith('darwin'):
@@ -287,6 +285,117 @@ def get_encrypted_password(password, hashtype='sha512', salt=None):
 
 def to_uuid(string):
     return str(uuid.uuid5(UUID_NAMESPACE_ANSIBLE, str(string)))
+
+def mandatory(a):
+    from jinja2.runtime import Undefined
+
+    ''' Make a variable mandatory '''
+    if isinstance(a, Undefined):
+        raise errors.AnsibleFilterError('Mandatory variable not defined.')
+    return a
+
+def combine(*terms, **kwargs):
+    recursive = kwargs.get('recursive', False)
+    if len(kwargs) > 1 or (len(kwargs) == 1 and 'recursive' not in kwargs):
+        raise errors.AnsibleFilterError("'recursive' is the only valid keyword argument")
+
+    for t in terms:
+        if not isinstance(t, dict):
+            raise errors.AnsibleFilterError("|combine expects dictionaries, got " + repr(t))
+
+    if recursive:
+        return reduce(merge_hash, terms)
+    else:
+        return dict(itertools.chain(*map(iteritems, terms)))
+
+def comment(text, style='plain', **kw):
+    # Predefined comment types
+    comment_styles = {
+        'plain': {
+            'decoration': '# '
+        },
+        'erlang': {
+            'decoration': '% '
+        },
+        'c': {
+            'decoration': '// '
+        },
+        'cblock': {
+            'beginning': '/*',
+            'decoration': ' * ',
+            'end': ' */'
+        },
+        'xml': {
+            'beginning': '<!--',
+            'decoration': ' - ',
+            'end': '-->'
+        }
+    }
+
+    # Pointer to the right comment type
+    style_params = comment_styles[style]
+
+    if 'decoration' in kw:
+        prepostfix = kw['decoration']
+    else:
+        prepostfix = style_params['decoration']
+
+    # Default params
+    p = {
+        'newline': '\n',
+        'beginning': '',
+        'prefix': (prepostfix).rstrip(),
+        'prefix_count': 1,
+        'decoration': '',
+        'postfix': (prepostfix).rstrip(),
+        'postfix_count': 1,
+        'end': ''
+    }
+
+    # Update default params
+    p.update(style_params)
+    p.update(kw)
+
+    # Compose substrings for the final string
+    str_beginning = ''
+    if p['beginning']:
+        str_beginning = "%s%s" % (p['beginning'], p['newline'])
+    str_prefix = str(
+        "%s%s" % (p['prefix'], p['newline'])) * int(p['prefix_count'])
+    str_text = ("%s%s" % (
+        p['decoration'],
+        # Prepend each line of the text with the decorator
+        text.replace(
+            p['newline'], "%s%s" % (p['newline'], p['decoration'])))).replace(
+                # Remove trailing spaces when only decorator is on the line
+                "%s%s" % (p['decoration'], p['newline']),
+                "%s%s" % (p['decoration'].rstrip(), p['newline']))
+    str_postfix = p['newline'].join(
+        [''] + [p['postfix'] for x in range(p['postfix_count'])])
+    str_end = ''
+    if p['end']:
+        str_end = "%s%s" % (p['newline'], p['end'])
+
+    # Return the final string
+    return "%s%s%s%s%s" % (
+        str_beginning,
+        str_prefix,
+        str_text,
+        str_postfix,
+        str_end)
+
+def extract(item, container, morekeys=None):
+    from jinja2.runtime import Undefined
+
+    value = container[item]
+
+    if value is not Undefined and morekeys is not None:
+        if not isinstance(morekeys, list):
+            morekeys = [morekeys]
+
+        value = reduce(lambda d, k: d[k], morekeys, value)
+
+    return value
 
 class FilterModule(object):
     ''' Ansible core jinja2 filters '''
@@ -317,22 +426,12 @@ class FilterModule(object):
             'realpath': partial(unicode_wrap, os.path.realpath),
             'relpath': partial(unicode_wrap, os.path.relpath),
             'splitext': partial(unicode_wrap, os.path.splitext),
-
-            # failure testing
-            'failed'  : failed,
-            'success' : success,
-
-            # changed testing
-            'changed' : changed,
-
-            # skip testing
-            'skipped' : skipped,
-
-            # variable existence
-            'mandatory': mandatory,
+            'win_basename': partial(unicode_wrap, ntpath.basename),
+            'win_dirname': partial(unicode_wrap, ntpath.dirname),
+            'win_splitdrive': partial(unicode_wrap, ntpath.splitdrive),
 
             # value as boolean
-            'bool': bool,
+            'bool': to_bool,
 
             # quote string for shell usage
             'quote': quote,
@@ -352,10 +451,10 @@ class FilterModule(object):
             'fileglob': fileglob,
 
             # regex
-            'match': match,
-            'search': search,
-            'regex': regex,
             'regex_replace': regex_replace,
+            'regex_escape': regex_escape,
+            'regex_search': regex_search,
+            'regex_findall': regex_findall,
 
             # ? : ;
             'ternary': ternary,
@@ -367,4 +466,15 @@ class FilterModule(object):
             # random stuff
             'random': rand,
             'shuffle': randomize_list,
+            # undefined
+            'mandatory': mandatory,
+
+            # merge dicts
+            'combine': combine,
+
+            # comment-style decoration
+            'comment': comment,
+
+            # array and dict lookups
+            'extract': extract,
         }
